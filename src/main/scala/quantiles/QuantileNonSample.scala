@@ -1,31 +1,41 @@
 package quantiles
 
+import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
+import scala.util.control.Breaks._
+import scala.util.Sorting.quickSort
 
 class QuantileNonSample[T](val sketchSize: Int,
                            private val shrinkingFactor: Double = 0.64)
                           (implicit ordering: Ordering[T],
                            ct: ClassTag[T]) extends Serializable{
 
-  private val maxCompactorNum = {
-    var n : Double= sketchSize
-    var ret=0
-    while (n>2) {
-      n = n*shrinkingFactor
-      ret+=1
+  private var curNumOfCompactors = 0
+  // initialize with ArrayBuffer, add compactors later
+  private var compactors = ArrayBuffer[NonSampleCompactor[T]]()
+  // number of items in compactors
+  private var compactorActualSize = 0
+  // overall capacity of compactors
+  private var compactorTotalSize = 0
+  expand()
+
+
+
+  // expand a layer of compactor
+  private def expand(): Unit = {
+    compactors = compactors :+ new NonSampleCompactor[T]
+    curNumOfCompactors = compactors.length
+    var size = 0
+    (0 until curNumOfCompactors).foreach { height =>
+      size = size + capacity(height)
     }
-    ret
+    compactorTotalSize = size
   }
 
-  private var curNumOfCompactors = 0
-  private var maxCompactorHeight = 0
-
-  // initialize with ArrayBuffer, add compactors later
-  private val compactors = ArrayBuffer[Compactor[T]]()
-  private val numberOfLayersWithMaximalSketchSize=1
-
-
+  private def capacity(height:Int): Int = {
+    Math.ceil(sketchSize * Math.pow(shrinkingFactor, height)).toInt + 1
+  }
 
   /**
     * update the sketch with a single item
@@ -33,82 +43,103 @@ class QuantileNonSample[T](val sketchSize: Int,
     * @param item new item observed by the sketch
     */
   def update(item: T): Unit = {
-    updateToCompactors(item,0)
-  }
+    compactors(0).buffer = compactors(0).buffer :+ item
 
-  /**
-    *
-    * @return memory currently consumed by the sketch
-    */
-  def itemMemSize(): Int = {
-    var k: Double =sketchSize
-    var ret : Int= (k*numberOfLayersWithMaximalSketchSize).toInt
-    k*= math.pow(shrinkingFactor,numberOfLayersWithMaximalSketchSize)
-    while (k>2) {
-      ret += math.ceil(k/2).toInt*2
-      k*=shrinkingFactor
-    }
-    ret+1
-  }
-
-  private def updateNonSample(item:T,weight:Long) = {
-    updateToCompactors(item, maxCompactorHeight-curNumOfCompactors)
-  }
-
-  private def log2exact(weight: Long) : Int= {
-    var w=weight
-    if (w<=0)
-      return -1
-    var ret=0
-    while(w>1) {
-      if (w%2==1)
-        return -1
-      w = w >> 1
-      ret+=1
-    }
-    ret
-  }
-
-  private def OutputHeight = maxCompactorHeight-curNumOfCompactors
-  private def update(item: T, weight: Long): Unit = {
-    if (weight < (1L << OutputHeight)) {
-      updateNonSample(item,weight)
-    } else {
-      val height = log2exact(weight)
-      assert(height>=0)
-      updateToCompactors(item,height)
+    compactorActualSize = compactorActualSize + 1
+    if (compactorActualSize > compactorTotalSize) {
+      condense()
     }
   }
 
-  private def updateToCompactors(item: T, height: Int) : Unit= {
-    // check if a new compactor needs to be added
-    if (height >= maxCompactorHeight)
-      addCompactor(item,height)
-    // update. If something got back, feed it
-    val output = compactors(height-OutputHeight).update(item)
-    if (output!=null) {
-      output.foreach{subItem =>
-        updateToCompactors(subItem,height+1)
+  private def condense(): Unit = {
+    breakable {
+      for (height <- compactors.indices) {
+        if (compactors(height).buffer.length >= capacity(height)) {
+          if (height + 1 >= curNumOfCompactors) expand()
+          val output: Array[T] = compactors(height).compact
+          output.foreach(element => compactors(height + 1).buffer = compactors(height + 1).buffer :+ element)
+          var size = 0
+          (0 until curNumOfCompactors).foreach { height =>
+            size = size + this.compactors(height).buffer.length
+          }
+          compactorActualSize = size
+          // implement lazy here
+          break
+        }
       }
     }
   }
 
-  private def addCompactor(item: T, height: Int): Unit = {
-    assert(height== maxCompactorHeight)
-    maxCompactorHeight+=1
-    compactors += new Compactor[T](sketchSize,item)
-    curNumOfCompactors+=1
+  private def compare[T](o1: T, o2: T)(implicit ord: Ordering[T]): Boolean = ord.gt(o1, o2)
 
-    // now that the height increased, everybody should shrink
-    for (i <- 0 until curNumOfCompactors-numberOfLayersWithMaximalSketchSize-1) {
-      compactors(i).shrink(shrinkingFactor)
+  /**
+    * Get the map which contains the rank of all items which is currently in the sketch.
+    * @return the map which contains the rank of all items which is currently in the sketch (RankMap)
+    */
+  def getRankMap(): mutable.Map[T,Long] = {
+    val Set = output.toMap.keySet
+    var states = scala.collection.mutable.Map[T,Long]()
+    Set.foreach{item =>
+      var curWeight = 0L
+      output.foreach(tuple => {
+        if (!compare(tuple._1,item)) {
+          curWeight = curWeight + tuple._2
+        }
+      })
+      states(item) = curWeight
     }
-    if (curNumOfCompactors>=numberOfLayersWithMaximalSketchSize) {
-      compactors(curNumOfCompactors-numberOfLayersWithMaximalSketchSize).shrink(
-        math.pow(shrinkingFactor,numberOfLayersWithMaximalSketchSize))
-    }
-
+    states
   }
+
+  /**
+    * Get CDF function of sketch items.
+    * @return CDF function
+    */
+  def getCDF(): Array[(T,Double)] = {
+    val rankMap = getRankMap()
+    val tmp = rankMap.keySet.toArray
+    quickSort(tmp)
+    val totalWeight = rankMap(tmp.last)
+    var ret = ArrayBuffer[(T,Double)]()
+    tmp.foreach{ item =>
+      ret = ret :+ (item, rankMap(item).toDouble / totalWeight.toDouble)
+    }
+    ret.toArray
+  }
+
+  /**
+    * Get the rank of query item without RankMap.
+    * @param item item to query
+    * @return the estimated rank of the query item in sketch
+    */
+  def getRank(item:T): Long = {
+    var r = 0L
+    output.foreach(tuple => {
+      if (!compare(tuple._1,item)) {
+        r = r + tuple._2
+      }
+    })
+    r
+  }
+
+  /**
+    * Get the rank of query item with RankMap.
+    * @param item item to query
+    * @param rankMap the estimated rank of the query item in sketch
+    * @return
+    */
+  def getRank(item:T, rankMap:mutable.Map[T,Long]): Long = {
+    val Set = rankMap.keySet
+    val ss = collection.immutable.SortedSet[T]() ++ Set
+    var curWeight = 0L
+    ss.foreach { SetItem =>
+      if(!compare(SetItem,item)){
+        curWeight = rankMap(SetItem)
+      }
+    }
+    curWeight
+  }
+
 
 
   /**
@@ -118,25 +149,30 @@ class QuantileNonSample[T](val sketchSize: Int,
     * @return the merged sketch
     */
   def merge(that: QuantileNonSample[T]) : QuantileNonSample[T] = {
-    if (maxCompactorHeight < that.maxCompactorHeight) {
-      return that.merge(this)
+    while (this.curNumOfCompactors < that.curNumOfCompactors) {
+      this.expand()
     }
-    var height = that.maxCompactorHeight-that.curNumOfCompactors
-    for (i<- 0 until that.curNumOfCompactors) {
-      that
-        .compactors(i)
-        .getItems
-        .foreach{item=>
-          update(item,1L << height)
-        }
-      height +=1
+
+    for (i <- 0 until that.curNumOfCompactors) {
+      that.compactors(i).buffer.toArray.foreach{ item=>
+        this.compactors(i).buffer = this.compactors(i).buffer :+ item
+      }
+    }
+    var size = 0
+    (0 until curNumOfCompactors).foreach { height =>
+      size = size + this.compactors(height).buffer.length
+    }
+    compactorActualSize = size
+
+    while (compactorActualSize >= compactorTotalSize) {
+      this.condense()
     }
     this
   }
 
   private def output: Array[(T,Long)] = {
     compactors.toArray.slice(0,curNumOfCompactors).zipWithIndex.flatMap{case (compactor,i) =>
-      compactor.getItems.map((_,1L << i))
+      compactor.buffer.toArray.map((_,1L << i))
     }
   }
 
@@ -167,5 +203,50 @@ class QuantileNonSample[T](val sketchSize: Int,
     }
     quantiles
   }
+
+  /**
+    * Count actual items in compactors.
+    * @return number of items existing in compactors
+    */
+  def getCompactorItemsCount: Int = {
+    var size = 0
+    compactors.toArray.slice(0,curNumOfCompactors).foreach{ compactor=>
+      size = size + compactor.buffer.length
+    }
+    size
+  }
+
+  /**
+    * Count total capacity of compactors.
+    * @return total capacity of compactors
+    */
+  def getCompactorCapacityCount: Int = {
+    var size = 0
+    for (height <- 0 until curNumOfCompactors) {
+      size = size + capacity(height)
+    }
+    size
+  }
+
+  private def getCompactorBuffer: Array[Int] = {
+    var size = ArrayBuffer[Int]()
+    compactors.toArray.slice(0,curNumOfCompactors).foreach{ compactor=>
+      size = size :+ compactor.buffer.length
+    }
+    size.toArray
+  }
+
+  private def getCompactorCapacity: Array[Int] = {
+    var size = Array[Int]()
+    for (height <- 0 until curNumOfCompactors) {
+      size = size :+ capacity(height)
+    }
+    size
+  }
+
+
+
+
+
 
 }
