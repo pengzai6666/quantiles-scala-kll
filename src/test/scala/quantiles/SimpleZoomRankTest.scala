@@ -31,7 +31,6 @@ class SimpleZoomRankTest extends FlatSpec with Matchers {
         qSketch.update(streamLen + 1 - i)
       }
 
-
       var count = 0
       (1 to streamLen).foreach{ i =>
         val estimate_r = qSketch.getRank(i)

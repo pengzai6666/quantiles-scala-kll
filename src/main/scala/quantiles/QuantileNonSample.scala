@@ -1,10 +1,9 @@
 package quantiles
 
-import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
 import scala.util.control.Breaks._
-import scala.util.Sorting.quickSort
+import scala.collection.immutable.ListMap
 
 class QuantileNonSample[T](val sketchSize: Int,
                            private val shrinkingFactor: Double = 0.64)
@@ -26,15 +25,11 @@ class QuantileNonSample[T](val sketchSize: Int,
   private def expand(): Unit = {
     compactors = compactors :+ new NonSampleCompactor[T]
     curNumOfCompactors = compactors.length
-    var size = 0
-    (0 until curNumOfCompactors).foreach { height =>
-      size = size + capacity(height)
-    }
-    compactorTotalSize = size
+    compactorTotalSize = getCompactorCapacityCount
   }
 
   private def capacity(height:Int): Int = {
-    Math.ceil(sketchSize * Math.pow(shrinkingFactor, height)).toInt + 1
+    2 * (Math.ceil(sketchSize * Math.pow(shrinkingFactor, height) / 2).toInt + 1)
   }
 
   /**
@@ -44,7 +39,6 @@ class QuantileNonSample[T](val sketchSize: Int,
     */
   def update(item: T): Unit = {
     compactors(0).buffer = compactors(0).buffer :+ item
-
     compactorActualSize = compactorActualSize + 1
     if (compactorActualSize > compactorTotalSize) {
       condense()
@@ -58,12 +52,7 @@ class QuantileNonSample[T](val sketchSize: Int,
           if (height + 1 >= curNumOfCompactors) expand()
           val output: Array[T] = compactors(height).compact
           output.foreach(element => compactors(height + 1).buffer = compactors(height + 1).buffer :+ element)
-          var size = 0
-          (0 until curNumOfCompactors).foreach { height =>
-            size = size + this.compactors(height).buffer.length
-          }
-          compactorActualSize = size
-          // implement lazy here
+          compactorActualSize = getCompactorItemsCount
           break
         }
       }
@@ -74,21 +63,17 @@ class QuantileNonSample[T](val sketchSize: Int,
 
   /**
     * Get the map which contains the rank of all items which is currently in the sketch.
-    * @return the map which contains the rank of all items which is currently in the sketch (RankMap)
+    * @return the sorted Listmap (by key)which contains the rank of all items which is currently in the sketch (RankMap)
     */
-  def getRankMap(): mutable.Map[T,Long] = {
-    val Set = output.toMap.keySet
+  def getRankMap(): ListMap[T,Long] = {
+    val sortedOutput = ListMap(output.toSeq.sortBy(_._1):_*)
     var states = scala.collection.mutable.Map[T,Long]()
-    Set.foreach{item =>
-      var curWeight = 0L
-      output.foreach(tuple => {
-        if (!compare(tuple._1,item)) {
-          curWeight = curWeight + tuple._2
-        }
-      })
-      states(item) = curWeight
+    var runningRank = 0L
+    sortedOutput.foreach{ tuple =>
+      runningRank = runningRank + tuple._2
+      states(tuple._1) = runningRank
     }
-    states
+    ListMap(states.toSeq.sortBy(_._1):_*)
   }
 
   /**
@@ -98,8 +83,7 @@ class QuantileNonSample[T](val sketchSize: Int,
   def getCDF(): Array[(T,Double)] = {
     val rankMap = getRankMap()
     val tmp = rankMap.keySet.toArray
-    quickSort(tmp)
-    val totalWeight = rankMap(tmp.last)
+    val totalWeight = rankMap.last._2
     var ret = ArrayBuffer[(T,Double)]()
     tmp.foreach{ item =>
       ret = ret :+ (item, rankMap(item).toDouble / totalWeight.toDouble)
@@ -128,16 +112,16 @@ class QuantileNonSample[T](val sketchSize: Int,
     * @param rankMap the estimated rank of the query item in sketch
     * @return
     */
-  def getRank(item:T, rankMap:mutable.Map[T,Long]): Long = {
-    val Set = rankMap.keySet
-    val ss = collection.immutable.SortedSet[T]() ++ Set
-    var curWeight = 0L
-    ss.foreach { SetItem =>
-      if(!compare(SetItem,item)){
-        curWeight = rankMap(SetItem)
+  def getRank(item:T, rankMap:ListMap[T,Long]): Long = {
+    var curRank = 0L
+    breakable {
+      for (target <- rankMap) {
+        if (compare(target._1, item))
+          break
+        curRank = target._2
       }
     }
-    curWeight
+    curRank
   }
 
 
@@ -154,15 +138,10 @@ class QuantileNonSample[T](val sketchSize: Int,
     }
 
     for (i <- 0 until that.curNumOfCompactors) {
-      that.compactors(i).buffer.toArray.foreach{ item=>
-        this.compactors(i).buffer = this.compactors(i).buffer :+ item
-      }
+      this.compactors(i).buffer = this.compactors(i).buffer ++ that.compactors(i).buffer
     }
-    var size = 0
-    (0 until curNumOfCompactors).foreach { height =>
-      size = size + this.compactors(height).buffer.length
-    }
-    compactorActualSize = size
+
+    compactorActualSize = getCompactorItemsCount
 
     while (compactorActualSize >= compactorTotalSize) {
       this.condense()
